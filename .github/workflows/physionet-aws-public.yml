@@ -10,44 +10,65 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Download demo from the official open AWS bucket
+      - name: Resolve public object keys and download matched ECG inputs
         run: |
-          mkdir -p export/clinical/hosp export/ecg export/packages
+          mkdir -p export/clinical/hosp export/ecg
           python - <<'PY'
-          import concurrent.futures,csv,hashlib,json,pathlib,urllib.request,xml.etree.ElementTree as ET
+          import concurrent.futures,csv,gzip,hashlib,io,json,pathlib,urllib.parse,urllib.request,xml.etree.ElementTree as ET
           base='https://physionet-open.s3.amazonaws.com/'
-          root=pathlib.Path('export')
+          root=pathlib.Path('export'); manifest=[]
+          ns={'s':'http://s3.amazonaws.com/doc/2006-03-01/'}
+          def keys(prefix,delimiter=None,maxkeys=1000):
+              args={'list-type':'2','prefix':prefix,'max-keys':str(maxkeys)}
+              if delimiter: args['delimiter']=delimiter
+              with urllib.request.urlopen(base+'?'+urllib.parse.urlencode(args),timeout=30) as r: tree=ET.fromstring(r.read())
+              result={'keys':[x.text for x in tree.findall('s:Contents/s:Key',ns)],'prefixes':[x.text for x in tree.findall('s:CommonPrefixes/s:Prefix',ns)]}
+              print('LIST',prefix,json.dumps(result),flush=True)
+              return result
           def get(key,dest):
               dest.parent.mkdir(parents=True,exist_ok=True)
-              with urllib.request.urlopen(base+key,timeout=30) as response, dest.open('wb') as out:
-                  while block:=response.read(1024*1024): out.write(block)
-              return {'key':key,'file':str(dest),'bytes':dest.stat().st_size,'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()}
-          results=[]
-          for name in ['patients.csv.gz','admissions.csv.gz','diagnoses_icd.csv.gz']:
-              try:
-                  r=get('mimic-iv-demo/2.2/hosp/'+name,root/'clinical'/'hosp'/name)
-                  results.append(r); print(json.dumps(r),flush=True)
-              except Exception as e: print('CLINICAL_ERROR',name,repr(e),flush=True)
-          prefix='mimic-iv-ecg-demo/0.1/'
-          try:
-              r=get(prefix+'record_list.csv',root/'ecg'/'record_list.csv')
-              results.append(r)
-              with (root/'ecg'/'record_list.csv').open() as f: records=list(csv.DictReader(f))
-              targets=[prefix+'LICENSE.txt',prefix+'SHA256SUMS.txt']
-              targets.extend(prefix+row['path']+ext for row in records for ext in ['.hea','.dat'])
-              def dl(key):
-                  r=get(key,root/'ecg'/key.removeprefix(prefix))
-                  return r
-              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                  for i,r in enumerate(pool.map(dl,targets)):
-                      results.append(r)
-                      if i%100==0: print('ECG_FILES',i,flush=True)
-          except Exception as e: print('ECG_ERROR',repr(e),flush=True)
-          (root/'manifest.json').write_text(json.dumps(results,indent=2))
-          print('TOTAL_FILES',len(results),flush=True)
+              with urllib.request.urlopen(base+urllib.parse.quote(key,safe='/'),timeout=60) as r, dest.open('wb') as out:
+                  while b:=r.read(1024*1024): out.write(b)
+              result={'source_url':base+key,'file':str(dest.relative_to(root)),'bytes':dest.stat().st_size,'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()}
+              return result
+          clinical=keys('mimic-iv-demo/')
+          for name in ['patients.csv.gz','admissions.csv.gz','diagnoses_icd.csv.gz','LICENSE.txt']:
+              matches=[k for k in clinical['keys'] if k.endswith('/'+name)]
+              if not matches: raise RuntimeError('Missing clinical key '+name)
+              k=matches[-1]
+              dest=root/'clinical'/'hosp'/name if name.endswith('.gz') else root/'clinical'/name
+              manifest.append(get(k,dest)); print('CLINICAL_OK',k,flush=True)
+          with gzip.open(root/'clinical/hosp/patients.csv.gz','rt') as f: ids={int(r['subject_id']) for r in csv.DictReader(f)}
+          print('CLINICAL_PATIENTS',len(ids),flush=True)
+          demo=keys('mimic-iv-ecg-demo/',delimiter='/')
+          full=keys('mimic-iv-ecg/',delimiter='/')
+          possible=demo['keys']+[k for p in demo['prefixes'] for k in keys(p,delimiter='/')['keys']]
+          is_demo=any(k.endswith('record_list.csv') for k in possible)
+          if not is_demo:
+              possible=full['keys']+[k for p in full['prefixes'] if '/files/' not in p for k in keys(p,delimiter='/')['keys']]
+          indexkeys=[k for k in possible if k.endswith('record_list.csv')]
+          if not indexkeys: raise RuntimeError('No ECG index key found')
+          indexkey=indexkeys[-1]; prefix=indexkey.removesuffix('record_list.csv')
+          print('ECG_SOURCE_INDEX',indexkey,'demo',is_demo,flush=True)
+          with urllib.request.urlopen(base+indexkey,timeout=60) as response:
+              reader=csv.DictReader(io.TextIOWrapper(response,encoding='utf-8'))
+              fields=reader.fieldnames
+              selected=[r for r in reader if int(r['subject_id']) in ids]
+          with (root/'ecg/record_list.csv').open('w') as f:
+              writer=csv.DictWriter(f,fieldnames=fields); writer.writeheader(); writer.writerows(selected)
+          print('MATCHED_ECGS',len(selected),flush=True)
+          (root/'source_details.json').write_text(json.dumps({'clinical_keys':clinical,'ecg_index_source':base+indexkey,'ecg_demo':is_demo,'selected_ecgs':len(selected)},indent=2))
+          targets=[prefix+r['path']+ext for r in selected for ext in ['.hea','.dat']]
+          for name in ['LICENSE.txt']:
+              targets.append(prefix+name)
+          def dl(k): return get(k,root/'ecg'/k.removeprefix(prefix))
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+              for i,r in enumerate(pool.map(dl,targets)):
+                  manifest.append(r)
+                  if i%100==0: print('ECG_FILES',i,flush=True)
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          print('TOTAL_FILES',len(manifest),flush=True)
           PY
-      - name: Download WFDB Python wheel
-        run: python -m pip download --no-deps 'wfdb>=4.1,<5' -d export/packages
       - name: Retain official public inputs
         if: always()
         uses: actions/upload-artifact@v4
