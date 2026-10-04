@@ -1,0 +1,47 @@
+name: Fetch public ECG analysis inputs
+on:
+  push:
+    branches: [physionet-demo-fetch-20261005]
+    paths: [.github/workflows/physionet-small-files.yml]
+permissions:
+  contents: read
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch small clinical tables and ECG archive
+        shell: bash
+        run: |
+          mkdir -p data/hosp data/wheels
+          for name in patients.csv.gz admissions.csv.gz diagnoses_icd.csv.gz; do
+            curl -4 -fL --connect-timeout 15 --max-time 45 --retry 1 "https://physionet.org/files/mimic-iv-demo/2.2/hosp/$name" -o "data/hosp/$name" || true
+          done
+          curl -4 -fL --connect-timeout 15 --max-time 120 --retry 1 https://physionet.org/content/mimic-iv-ecg-demo/get-zip/0.1/ -o data/ecg-demo.zip || true
+          python -m pip download --no-deps wfdb -d data/wheels
+          python - <<'PY'
+          import csv,gzip,json,hashlib,pathlib,zipfile
+          root=pathlib.Path('data')
+          manifest=[]
+          for p in root.rglob('*'):
+              if p.is_file():
+                  manifest.append({'path':str(p),'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+          print(json.dumps(manifest,indent=2),flush=True)
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          for p in (root/'hosp').glob('*.gz'):
+              with gzip.open(p,'rt') as f:
+                  rows=list(csv.DictReader(f))
+              print(p.name,'rows',len(rows),flush=True)
+          p=root/'ecg-demo.zip'
+          if p.exists():
+              with zipfile.ZipFile(p) as z:
+                  print('ECG zip members:',len(z.namelist()),'testzip:',z.testzip(),flush=True)
+          PY
+      - name: Upload retrieved public files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-ecg-analysis-inputs
+          path: data/
+          retention-days: 1
+          compression-level: 0
