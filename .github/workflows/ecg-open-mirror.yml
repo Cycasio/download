@@ -1,0 +1,52 @@
+name: Open ECG demo mirror inputs
+on:
+  push:
+    branches: [physionet-demo-fetch-20261005]
+    paths: [.github/workflows/ecg-open-mirror.yml]
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Retrieve open demo files and provenance
+        run: |
+          mkdir -p export
+          python - <<'PY'
+          import concurrent.futures,hashlib,json,pathlib,urllib.parse,urllib.request
+          root=pathlib.Path('export')
+          api='https://huggingface.co/api/datasets/vlbthambawita/ECGBench/tree/main/mimic_iv_ecg_demo/original?recursive=true&limit=1000'
+          entries=[]
+          while api:
+              with urllib.request.urlopen(api,timeout=40) as r:
+                  entries.extend(json.load(r)); link=r.headers.get('Link','')
+              api=None
+              for part in link.split(','):
+                  if 'rel="next"' in part: api=part.split('<')[1].split('>')[0]
+          (root/'hf_tree.json').write_text(json.dumps(entries,indent=2))
+          files=[e for e in entries if e.get('type')=='file']
+          print('FILES',json.dumps(files),flush=True)
+          total=sum(e.get('size',0) for e in files)
+          print('TOTAL_BYTES',total,flush=True)
+          if total>250_000_000: raise RuntimeError('Open demo transfer limit exceeded')
+          def get(e):
+              path=e['path']; url='https://huggingface.co/datasets/vlbthambawita/ECGBench/resolve/main/'+path+'?download=true'
+              dest=root/path; dest.parent.mkdir(parents=True,exist_ok=True)
+              with urllib.request.urlopen(url,timeout=90) as r, dest.open('wb') as out:
+                  while block:=r.read(1024*1024): out.write(block)
+              result={'source_url':url,'file':path,'bytes':dest.stat().st_size,'sha256':hashlib.sha256(dest.read_bytes()).hexdigest()}
+              print('DOWNLOADED',path,result['bytes'],flush=True)
+              return result
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool: manifest=list(pool.map(get,files))
+          (root/'manifest.json').write_text(json.dumps(manifest,indent=2))
+          PY
+      - name: Retain retrieved open demo inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-ecg-demo-mirror
+          path: export/
+          retention-days: 1
+          compression-level: 1
+          if-no-files-found: error
